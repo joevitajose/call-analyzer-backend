@@ -3,7 +3,6 @@ import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import crypto from "crypto";
-import { File } from "node:buffer";
 
 dotenv.config();
 
@@ -14,64 +13,51 @@ app.use(express.json({ limit: "2mb" }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function auth(req, res, next) {
-  const authHeader = req.headers.authorization || "";
   const expected = `Bearer ${process.env.ACTION_SECRET}`;
-  if (authHeader !== expected) return res.status(401).json({ error: "Unauthorized" });
+  const got = req.headers.authorization;
+  if (!got || got !== expected) return res.status(401).json({ error: "Unauthorized" });
   next();
 }
 
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
 app.post("/transcribe", auth, async (req, res) => {
   try {
-    const fileRef = req.body?.openaiFileIdRefs?.[0];
-
-    // ChatGPT Actions sends a temporary download URL for the uploaded audio file
-    const fileUrl =
-      fileRef?.url ||
-      fileRef?.download_url ||
-      fileRef?.file_url ||
-      fileRef?.href;
-
-    if (!fileUrl) {
-      return res.status(400).json({
-        error: "No audio file URL found in openaiFileIdRefs[0].",
-        hint: "Make sure your Action requestBody uses openaiFileIdRefs.",
-      });
+    const refs = req.body?.openaiFileIdRefs;
+    if (!Array.isArray(refs) || refs.length === 0) {
+      return res.status(400).json({ error: "Missing openaiFileIdRefs (upload audio in ChatGPT)" });
     }
 
-    // Download audio immediately (URL expires quickly)
-    const audioResponse = await fetch(fileUrl);
-    if (!audioResponse.ok) {
-      return res.status(400).json({ error: `Failed to download audio: ${audioResponse.status}` });
+    const fileRef = refs[0];
+    const fileUrl = fileRef.url || fileRef.download_url;
+    if (!fileUrl) return res.status(400).json({ error: "No file URL found in openaiFileIdRefs[0]" });
+
+    const audioResp = await fetch(fileUrl);
+    if (!audioResp.ok) {
+      return res.status(400).json({ error: `Failed to download audio: ${audioResp.status}` });
     }
 
-    const buffer = Buffer.from(await audioResponse.arrayBuffer());
+    const buffer = Buffer.from(await audioResp.arrayBuffer());
 
-    // Transcribe with diarization
+    // Node 18+ supports File
+    const file = new File([buffer], "call.mp3", { type: "audio/mpeg" });
+
     const transcription = await openai.audio.transcriptions.create({
-      file: new File([buffer], "call.wav"),
-      model: "gpt-4o-transcribe-diarize",
-      chunking: "auto",
-      response_format: "diarized_json",
+      file,
+      model: "whisper-1",
     });
 
-    const segments = (transcription.segments || []).map((s) => ({
-      start: s.start,
-      end: s.end,
-      speaker: s.speaker,
-      text: s.text,
-    }));
-
-    res.json({
+    const text = transcription.text || "";
+    return res.json({
       call_id: crypto.randomUUID(),
-      duration_sec: transcription.duration ?? null,
-      segments,
+      duration_sec: 0,
+      segments: text ? [{ start: 0, end: 0, speaker: "Unknown", text }] : [],
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Transcription failed" });
+    return res.status(500).json({ error: "Transcription failed", details: err?.message || String(err) });
   }
 });
 
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-app.listen(3000, () => console.log("Server running on http://localhost:3000"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
