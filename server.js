@@ -1,40 +1,51 @@
+// server.js (DISK upload + "accept anything" transcription with ffmpeg fallback)
+// Works better on Render for large files because it avoids multer.memoryStorage() RAM spikes.
+
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import crypto from "crypto";
 import multer from "multer";
-import { fileTypeFromBuffer } from "file-type";
 import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawn } from "child_process";
 import ffmpegPath from "ffmpeg-static";
+import { fileTypeFromBuffer } from "file-type";
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
 
-// Increase if you expect long recordings
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB
+// Optional: nicer root response (prevents "Cannot GET /")
+app.get("/", (_req, res) => {
+  res.send("Call Analyzer backend is running. Use GET /health or POST /transcribe");
 });
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
 function auth(req, res, next) {
   const expected = `Bearer ${process.env.ACTION_SECRET}`;
   const got = req.headers.authorization;
-  if (!got || got !== expected) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (!got || got !== expected) return res.status(401).json({ error: "Unauthorized" });
   next();
 }
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// ---- Multer: DISK storage (critical for big files on Render) ----
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, os.tmpdir()),
+    filename: (_req, file, cb) => {
+      const safe = (file.originalname || "upload").replace(/[^\w.-]/g, "_");
+      cb(null, `${crypto.randomUUID()}-${safe}`);
+    },
+  }),
+  limits: { fileSize: 300 * 1024 * 1024 }, // 300MB
+});
 
+// ---- Helpers ----
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });
@@ -48,7 +59,19 @@ function run(cmd, args) {
   });
 }
 
-async function transcribeFile(filePath) {
+// Read only the first chunk for type detection (memory-safe)
+function readHead(filePath, bytes = 64 * 1024) {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buf = Buffer.alloc(bytes);
+    const read = fs.readSync(fd, buf, 0, bytes, 0);
+    return buf.subarray(0, read);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+async function transcribeFile(openai, filePath) {
   const transcription = await openai.audio.transcriptions.create({
     file: fs.createReadStream(filePath),
     model: "whisper-1",
@@ -56,33 +79,36 @@ async function transcribeFile(filePath) {
   return transcription?.text || "";
 }
 
+// ---- OpenAI ----
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ---- Route ----
 app.post("/transcribe", auth, upload.single("file"), async (req, res) => {
   const call_id = crypto.randomUUID();
-
-  const tmpDir = os.tmpdir();
   let inputPath = null;
   let normalizedPath = null;
 
   try {
-    if (!req.file) {
+    if (!req.file?.path) {
       return res.status(400).json({ error: "Missing file. Upload an audio file." });
     }
 
-    // Detect actual file container from bytes (more reliable than mimetype)
-    const detected = await fileTypeFromBuffer(req.file.buffer);
-    const ext = (
-      detected?.ext ||
-      req.file.originalname?.split(".").pop() ||
-      "bin"
-    ).toLowerCase();
+    if (!ffmpegPath) {
+      return res.status(500).json({
+        error: "Server misconfigured",
+        details: "ffmpeg-static did not provide a binary path.",
+      });
+    }
 
-    // Save original upload to a temp file
-    inputPath = path.join(tmpDir, `call-${call_id}.${ext}`);
-    fs.writeFileSync(inputPath, req.file.buffer);
+    inputPath = req.file.path;
 
-    // 1) Try direct transcription first (fast path)
+    // Detect container/type from file header (not from mimetype)
+    const head = readHead(inputPath);
+    const detected = await fileTypeFromBuffer(head);
+
+    // 1) Try direct transcription first
     try {
-      const text = await transcribeFile(inputPath);
+      const text = await transcribeFile(openai, inputPath);
 
       return res.json({
         call_id,
@@ -96,30 +122,24 @@ app.post("/transcribe", auth, upload.single("file"), async (req, res) => {
         },
       });
     } catch (directError) {
-      // 2) Fallback: normalize via ffmpeg to WAV (16k mono), then transcribe
-      normalizedPath = path.join(tmpDir, `call-${call_id}.wav`);
+      // 2) Fallback: normalize to WAV 16k mono, then transcribe
+      normalizedPath = path.join(os.tmpdir(), `call-${call_id}.wav`);
 
       const ffmpegArgs = [
         "-y",
         "-i",
         inputPath,
         "-ac",
-        "1",       // mono
+        "1", // mono
         "-ar",
-        "16000",   // 16kHz
-        "-vn",     // strip video track if any
+        "16000", // 16kHz
+        "-vn", // strip video if present
         normalizedPath,
       ];
 
-      if (!ffmpegPath) {
-        throw new Error(
-          "ffmpeg-static did not provide a binary path. Check Render architecture or ffmpeg-static install."
-        );
-      }
-
       await run(ffmpegPath, ffmpegArgs);
 
-      const text = await transcribeFile(normalizedPath);
+      const text = await transcribeFile(openai, normalizedPath);
 
       return res.json({
         call_id,
@@ -141,15 +161,18 @@ app.post("/transcribe", auth, upload.single("file"), async (req, res) => {
       details: err?.message || String(err),
     });
   } finally {
-    // Cleanup temp files
+    // Cleanup uploaded file from disk
     try {
       if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
     } catch {}
+
+    // Cleanup normalized file
     try {
       if (normalizedPath && fs.existsSync(normalizedPath)) fs.unlinkSync(normalizedPath);
     } catch {}
   }
 });
 
+// ---- Start ----
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

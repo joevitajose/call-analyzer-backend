@@ -8,10 +8,6 @@
     "dev": "node server.js",
     "test": "echo \"OK\""
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
