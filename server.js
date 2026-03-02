@@ -16,42 +16,32 @@ dotenv.config();
 const app = express();
 app.use(cors());
 
-// Increase file size limit if needed (200MB here)
+// Increase if you expect long recordings
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 200 * 1024 * 1024 },
+  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB
 });
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function auth(req, res, next) {
   const expected = `Bearer ${process.env.ACTION_SECRET}`;
   const got = req.headers.authorization;
-
   if (!got || got !== expected) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
 }
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
-});
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
-    const process = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });
-
+    const p = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
-    process.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-
-    process.on("error", reject);
-
-    process.on("close", (code) => {
+    p.stderr.on("data", (d) => (stderr += d.toString()));
+    p.on("error", reject);
+    p.on("close", (code) => {
       if (code === 0) resolve();
       else reject(new Error(`${cmd} exited with code ${code}: ${stderr}`));
     });
@@ -63,7 +53,6 @@ async function transcribeFile(filePath) {
     file: fs.createReadStream(filePath),
     model: "whisper-1",
   });
-
   return transcription?.text || "";
 }
 
@@ -76,33 +65,29 @@ app.post("/transcribe", auth, upload.single("file"), async (req, res) => {
 
   try {
     if (!req.file) {
-      return res.status(400).json({
-        error: "Missing file. Upload an audio file.",
-      });
+      return res.status(400).json({ error: "Missing file. Upload an audio file." });
     }
 
-    // Detect real file type from bytes
+    // Detect actual file container from bytes (more reliable than mimetype)
     const detected = await fileTypeFromBuffer(req.file.buffer);
+    const ext = (
+      detected?.ext ||
+      req.file.originalname?.split(".").pop() ||
+      "bin"
+    ).toLowerCase();
 
-    const ext =
-      (detected?.ext ||
-        req.file.originalname?.split(".").pop() ||
-        "bin").toLowerCase();
-
-    // Save original upload
+    // Save original upload to a temp file
     inputPath = path.join(tmpDir, `call-${call_id}.${ext}`);
     fs.writeFileSync(inputPath, req.file.buffer);
 
-    // ---------- STEP 1: Try direct transcription ----------
+    // 1) Try direct transcription first (fast path)
     try {
       const text = await transcribeFile(inputPath);
 
       return res.json({
         call_id,
         duration_sec: 0,
-        segments: text
-          ? [{ start: 0, end: 0, speaker: "Unknown", text }]
-          : [],
+        segments: text ? [{ start: 0, end: 0, speaker: "Unknown", text }] : [],
         meta: {
           mode: "direct",
           detected,
@@ -111,7 +96,7 @@ app.post("/transcribe", auth, upload.single("file"), async (req, res) => {
         },
       });
     } catch (directError) {
-      // ---------- STEP 2: Fallback conversion ----------
+      // 2) Fallback: normalize via ffmpeg to WAV (16k mono), then transcribe
       normalizedPath = path.join(tmpDir, `call-${call_id}.wav`);
 
       const ffmpegArgs = [
@@ -122,9 +107,15 @@ app.post("/transcribe", auth, upload.single("file"), async (req, res) => {
         "1",       // mono
         "-ar",
         "16000",   // 16kHz
-        "-vn",     // remove video
+        "-vn",     // strip video track if any
         normalizedPath,
       ];
+
+      if (!ffmpegPath) {
+        throw new Error(
+          "ffmpeg-static did not provide a binary path. Check Render architecture or ffmpeg-static install."
+        );
+      }
 
       await run(ffmpegPath, ffmpegArgs);
 
@@ -133,9 +124,7 @@ app.post("/transcribe", auth, upload.single("file"), async (req, res) => {
       return res.json({
         call_id,
         duration_sec: 0,
-        segments: text
-          ? [{ start: 0, end: 0, speaker: "Unknown", text }]
-          : [],
+        segments: text ? [{ start: 0, end: 0, speaker: "Unknown", text }] : [],
         meta: {
           mode: "ffmpeg-fallback",
           detected,
@@ -146,8 +135,7 @@ app.post("/transcribe", auth, upload.single("file"), async (req, res) => {
       });
     }
   } catch (err) {
-    console.error("Transcription error:", err);
-
+    console.error("Transcription failed:", err);
     return res.status(500).json({
       error: "Transcription failed",
       details: err?.message || String(err),
@@ -155,21 +143,13 @@ app.post("/transcribe", auth, upload.single("file"), async (req, res) => {
   } finally {
     // Cleanup temp files
     try {
-      if (inputPath && fs.existsSync(inputPath)) {
-        fs.unlinkSync(inputPath);
-      }
+      if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
     } catch {}
-
     try {
-      if (normalizedPath && fs.existsSync(normalizedPath)) {
-        fs.unlinkSync(normalizedPath);
-      }
+      if (normalizedPath && fs.existsSync(normalizedPath)) fs.unlinkSync(normalizedPath);
     } catch {}
   }
 });
 
 const PORT = process.env.PORT || 10000;
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
