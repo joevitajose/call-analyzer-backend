@@ -1,7 +1,7 @@
 {
   "name": "call-analyzer-backend",
   "version": "1.0.0",
-   "type": "module",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -14,6 +14,7 @@
     "cors": "^2.8.6",
     "dotenv": "^17.2.4",
     "express": "^5.2.1",
+    "multer": "^2.1.0",
     "openai": "^6.21.0"
   }
 }
